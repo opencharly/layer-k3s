@@ -1,3 +1,4 @@
+version: 2026.232.0520
 k3s:
     candy:
         version: 2026.144.1443

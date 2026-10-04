@@ -35,8 +35,8 @@ k3s:
             - run: |
                 command=set -euo pipefail
                 # Pinned version — update when cutting over.
-                K3S_VERSION="v1.31.11+k3s1"
-                K3S_VERSION_URL="v1.31.11%2Bk3s1"
+                K3S_VERSION="v1.37.0+k3s1"
+                K3S_VERSION_URL="v1.37.0%2Bk3s1"
                 MACHINE="$(uname -m)"
                 case "${MACHINE}" in
                   x86_64) BIN_SUFFIX=""; SHA_SUFFIX="amd64";;
@@ -68,8 +68,8 @@ k3s:
               command: |
                 set -euo pipefail
                 # Pinned version — update when cutting over.
-                K3S_VERSION="v1.31.11+k3s1"
-                K3S_VERSION_URL="v1.31.11%2Bk3s1"
+                K3S_VERSION="v1.37.0+k3s1"
+                K3S_VERSION_URL="v1.37.0%2Bk3s1"
                 MACHINE="$(uname -m)"
                 case "${MACHINE}" in
                   x86_64) BIN_SUFFIX=""; SHA_SUFFIX="amd64";;
@@ -154,7 +154,7 @@ k3s-skill:
             | Property | Value |
             |----------|-------|
             | Install files | `charly.yml` (binary fetch + symlinks via a `run:` plan step) |
-            | Pinned version | `v1.31.11+k3s1` (edit `K3S_VERSION` in `charly.yml` vars to cut over) |
+            | Pinned version | `v1.37.0+k3s1` (edit `K3S_VERSION` in `charly.yml` vars to cut over) |
             
             ## What this candy does
             

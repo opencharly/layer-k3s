@@ -215,69 +215,10 @@ k3s-shared-containerd:
                   name: nvidia
                 handler: nvidia
             - run: install the runtime-handler guard
-              write: /usr/local/bin/k3s-runtime-handler-guard
+              copy: files/k3s-runtime-handler-guard.sh
+              to: /usr/local/bin/k3s-runtime-handler-guard
               mode: "0755"
               run_as: root
-              content: |
-                #!/bin/sh
-                # Restart k3s when the shared containerd's runtime-handler set changed.
-                #
-                # k3s asks the CRI for its runtime set once, at start, and latches the
-                # answer. A handler added to the shared containerd afterwards is
-                # invisible to kubelet until the service restarts (K3S.md §2.3 step 3).
-                # This guard fingerprints the merged containerd CRI runtime map and
-                # restarts k3s only when that fingerprint moves.
-                set -eu
-
-                state_dir=/var/lib/k3s-shared-containerd
-                state_file="${state_dir}/runtime-handlers.sha256"
-
-                # The guard has a subject only while k3s runs. At image-build time (and
-                # on a venue that has not started k3s yet) there is nothing to restart.
-                if ! systemctl is-active --quiet k3s 2>/dev/null; then
-                    exit 0
-                fi
-
-                if ! command -v containerd >/dev/null 2>&1; then
-                    echo "k3s-runtime-handler-guard: containerd is not on PATH; cannot read the runtime set" >&2
-                    exit 1
-                fi
-
-                # `containerd config dump` is the MERGED config: it includes conf.d.
-                handlers="$(containerd config dump 2>/dev/null \
-                    | sed -n "s/^[[:space:]]*\[plugins\.[^]]*containerd\.runtimes\.\([^].]*\)\]$/\1/p" \
-                    | sort -u \
-                    | tr '\n' ' ')"
-
-                if [ -z "${handlers}" ]; then
-                    echo "k3s-runtime-handler-guard: the merged containerd config declares no CRI runtime handlers" >&2
-                    exit 1
-                fi
-
-                fingerprint="$(printf '%s' "${handlers}" | sha256sum | cut -d' ' -f1)"
-                mkdir -p "${state_dir}"
-
-                if [ ! -f "${state_file}" ]; then
-                    printf '%s\n' "${fingerprint}" > "${state_file}"
-                    # The layer writes its config before k3s starts, so a fresh deploy
-                    # records the baseline here and k3s latches it at its own start.
-                    # If k3s was already running when this layer arrived, its latch
-                    # predates this config: restart once so it sees the new set.
-                    if systemctl is-active --quiet k3s; then
-                        echo "k3s-runtime-handler-guard: baseline recorded on a running k3s; restarting it" >&2
-                        systemctl restart k3s
-                    fi
-                    exit 0
-                fi
-
-                previous="$(cat "${state_file}")"
-                if [ "${previous}" = "${fingerprint}" ]; then
-                    exit 0
-                fi
-
-                printf '%s\n' "${fingerprint}" > "${state_file}"
-                echo "k3s-runtime-handler-guard: runtime handlers changed; restarting k3s" >&2
-                systemctl restart k3s
             - run: record the handler baseline and restart k3s only when it moved
               command: |
                 set -eu
@@ -296,6 +237,7 @@ k3s-shared-containerd:
             - check: the containerd drop-in carries the k3s CNI config directory
               file:
                 file: /etc/containerd/conf.d/50-k3s-cni.toml
+                exists: true
                 contains: "/var/lib/rancher/k3s/agent/etc/cni/net.d"
             - check: the krun RuntimeClass manifest is installed
               file:
@@ -338,8 +280,10 @@ check-k3s-shared-containerd:
             RuntimeClass is served; (2) perform - start k3s from the config this
             layer installed; (3) presence - the node is Ready on containerd 2.x,
             k3s's pods are visible in `nerdctl -n k8s.io ps` on the SHARED socket
-            (the discriminating proof it is not k3s's embedded containerd), and
-            both RuntimeClasses are served. Run it INSIDE the disposable venue,
+            (the discriminating proof it is not k3s's embedded containerd),
+            both RuntimeClasses are served, and the handler guard has a baseline
+            and is idempotent on an unchanged handler set. Run it INSIDE the
+            disposable venue,
             e.g. `charly --host <containerd-host-vm> check run
             check-k3s-shared-containerd`; a top-level `host: local` bed writes to
             the machine it runs on.
@@ -373,7 +317,9 @@ check-k3s-shared-containerd:
                 command: |
                   set -eu
                   if ! sudo -n systemctl is-active --quiet k3s; then
-                    sudo -n systemd-run --unit=k3s-shared-containerd-bed --collect \
+                    # The unit is named `k3s` on purpose: the runtime-handler guard
+                    # keys on `systemctl is-active k3s`, so this bed can exercise it.
+                    sudo -n systemd-run --unit=k3s --collect \
                       /usr/local/bin/k3s server --config /etc/rancher/k3s/config.yaml
                   fi
                   i=0
@@ -413,6 +359,22 @@ check-k3s-shared-containerd:
                   test "${pods}" -gt 0
                   sudo -n nerdctl --address /run/containerd/containerd.sock -n k8s.io ps
                   echo "PRESENT: node Ready on the shared containerd, k3s pods on the shared socket, krun+nvidia served"
+                in_container: false
+            - check: the runtime-handler guard has a baseline and does not restart k3s on an unchanged handler set
+              id: guard-idempotent
+              timeout: 120s
+              context:
+                - runtime
+              command:
+                command: |
+                  set -eu
+                  before="$(sudo -n systemctl show k3s -p ActiveEnterTimestampMonotonic --value)"
+                  test -n "${before}"
+                  sudo -n test -s /var/lib/k3s-shared-containerd/runtime-handlers.sha256
+                  sudo -n /usr/local/bin/k3s-runtime-handler-guard
+                  after="$(sudo -n systemctl show k3s -p ActiveEnterTimestampMonotonic --value)"
+                  test "${before}" = "${after}"
+                  echo "GUARD-IDEMPOTENT: baseline present; no restart on an unchanged handler set"
                 in_container: false
 
 k3s-skill:

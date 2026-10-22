@@ -34,6 +34,10 @@ Canonical files:
   valid on every distro arm they run on. Scope a distro-specific check in the
   command itself — the check runner does not honour runner-level
   `exclude-distro` fields.
+- The handler guard's branch logic is covered by
+  `bash test/k3s-runtime-handler-guard-test.sh`; run it whenever
+  `files/k3s-runtime-handler-guard.sh` changes.
+- `charly box validate` must stay at 0 warnings, 0 errors.
 
 ## Modify this repo
 
@@ -52,6 +56,9 @@ Canonical files:
 - The `check-k3s-shared-containerd` bed is a `host: local` bed: run it inside a
   disposable containerd-host venue (`charly --host … check run …`), never on an
   operator workstation.
+- `files/k3s-runtime-handler-guard.sh` and
+  `test/k3s-runtime-handler-guard-test.sh` move together: a behavior change in
+  the guard is only landed with its branch test updated.
 
 ## Landing
 

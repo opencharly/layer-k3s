@@ -57,7 +57,7 @@ daemon and owns no part of the shared containerd's config.
 | k3s config | `/etc/rancher/k3s/config.yaml` → `container-runtime-endpoint: unix:///run/containerd/containerd.sock` |
 | CNI drop-in | `/etc/containerd/conf.d/50-k3s-cni.toml` (partial): `bin_dirs = ["/var/lib/rancher/k3s/data/current/bin"]`, `conf_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"` |
 | RuntimeClasses | `/var/lib/rancher/k3s/server/manifests/{krun,nvidia}-runtimeclass.yaml` (`node.k8s.io/v1`, `handler: krun` / `handler: nvidia`) |
-| Handler guard | `/usr/local/bin/k3s-runtime-handler-guard` + a `run:` step that records the baseline and restarts k3s only when the handler set moved |
+| Handler guard | `/usr/local/bin/k3s-runtime-handler-guard` (from `files/`) + a `run:` step that records the baseline when the shared socket exists and restarts a running k3s only on a change |
 | Service / port | none (k3s-server / the lease image owns the unit) |
 
 **Namespaces.** k3s uses `k8s.io`; nerdctl uses `default`, on the same socket.
@@ -72,16 +72,26 @@ from this layer.
 **The restart-after-handler-change rule.** k3s reads the CRI runtime set (and the
 cgroup driver) once, at start; a handler added later is invisible to kubelet until
 `k3s` restarts (`K3S.md` §2.3 step 3). The guard fingerprints the MERGED containerd
-runtime map (`containerd config dump`, which includes `conf.d`) and restarts k3s
-only when the fingerprint changes:
+runtime map (`containerd config dump`, which includes `conf.d`) and behaves as
+follows:
 
-- fresh deploy: the layer's `run:` step records the baseline before k3s starts;
-- later layer application: the step compares and restarts on a change;
-- a handler added outside charly: run `sudo systemctl restart k3s` (or the guard
-  script) explicitly.
+- **no shared-daemon socket** (image build, or a host that has not started
+  containerd): exit 0 without recording a baseline — there is nothing to
+  fingerprint;
+- **first application with the socket present**: record the baseline. On a fresh
+  deploy this runs before k3s starts, so the baseline is the set k3s latches; if
+  k3s was already running, restart it once because its latch predates this layer;
+- **later application, fingerprint unchanged**: exit 0, no restart;
+- **later application, fingerprint changed while k3s runs**: restart k3s;
+- **later application, fingerprint changed while k3s is not running**: update the
+  baseline; the next start latches the new set (no restart is needed);
+- **a handler added outside charly**: run
+  `sudo /usr/local/bin/k3s-runtime-handler-guard` or `sudo systemctl restart k3s`
+  explicitly.
 
-The guard exits 0 when k3s is not active, which is what makes the same `run:` step
-safe at image-build time and on a venue that has not started k3s yet.
+The guard takes `K3S_HANDLER_GUARD_STATE_DIR` and `K3S_HANDLER_GUARD_SOCKET`
+overrides for its regression test (`test/k3s-runtime-handler-guard-test.sh`), which
+covers every branch above.
 
 **The discriminating proof.** `nerdctl -n k8s.io ps` on
 `/run/containerd/containerd.sock` must show k3s's pods. An embedded containerd
@@ -107,7 +117,11 @@ never on an operator workstation.
 - `k3s-shared-containerd`: the endpoint, both CNI keys, both RuntimeClass
   manifests, and the executable guard are present.
 - The bed proves an absence, then a Ready node on the shared containerd with
-  k3s's pods in `nerdctl -n k8s.io ps`, then both RuntimeClasses.
+  k3s's pods in `nerdctl -n k8s.io ps`, then both RuntimeClasses, then that the
+  installed guard has a baseline and does not restart k3s on an unchanged set.
+- `test/k3s-runtime-handler-guard-test.sh` covers the guard's socket-absent,
+  baseline, unchanged, changed-while-running, and changed-while-inactive
+  branches.
 
 ## Related Candies
 - `/charly-infrastructure:k3s-server` — Control-plane node (depends on this candy)

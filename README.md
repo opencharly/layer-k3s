@@ -86,11 +86,18 @@ grep container-runtime-endpoint /etc/rancher/k3s/config.yaml
 k3s asks the CRI for its runtime set (and cgroup driver) once, at start. A
 handler added to the shared containerd later — for example the `nvidia` handler
 written by the NVIDIA toolkit — is invisible to kubelet until `k3s` restarts.
-The layer installs `/usr/local/bin/k3s-runtime-handler-guard`, which fingerprints
-the merged containerd CRI runtime map and restarts k3s only when that
-fingerprint moves. Its `run:` step executes at install time (recording the
-baseline before k3s starts) and on every later application of the layer. If a
-handler is added outside a charly run, restart k3s explicitly:
+The layer installs `/usr/local/bin/k3s-runtime-handler-guard`. Its `run:` step
+executes at install time and on every later application of the layer. The guard
+is a no-op where the shared daemon's socket does not exist (an image build, or a
+host that has not started containerd): there is nothing to fingerprint. Where
+the socket does exist it records the fingerprint of the merged containerd CRI
+runtime map; because the install step runs before k3s starts, that baseline is
+the set the server latches. On later applications it restarts k3s only when the
+fingerprint changed while k3s was running; if k3s was not running it updates the
+baseline, and the next start latches the new set. On the first application while
+k3s is already running it restarts once, because that k3s latched a set older
+than this layer. If a handler is added outside a charly run, restart k3s
+explicitly:
 
 ```bash
 sudo systemctl restart k3s
@@ -106,6 +113,8 @@ presence — of this layer on a **disposable containerd-host venue**:
 3. `present-after` — the node is Ready on `containerd://2.x`, k3s's pods are
    visible in `nerdctl -n k8s.io ps` on the SHARED socket (the proof it is not
    the embedded daemon), and both RuntimeClasses are served.
+4. `guard-idempotent` — the handler guard has a baseline for the running unit and
+   does not restart k3s when the handler set is unchanged.
 
 It is a `host: local` bed, so run it **inside** the disposable venue:
 
@@ -122,6 +131,9 @@ k3s binary, and starts a control plane.
   `k3s-shared-containerd:` candy (shared-containerd wiring), the
   `k3s-shared-containerd-app:` local template, the
   `check-k3s-shared-containerd:` bed, and the embedded `k3s-skill:` entity.
+- `files/k3s-runtime-handler-guard.sh` — the installed handler guard.
+- `test/k3s-runtime-handler-guard-test.sh` — its branch regression test
+  (`bash test/k3s-runtime-handler-guard-test.sh`).
 - `.agents/skills/k3s/SKILL.md` — the owning skill body.
 - `.github/workflows/tag-on-merge.yml` — CalVer tag + `CHANGELOG/` on merge.
 - `README.md` — this user overview.

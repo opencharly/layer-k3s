@@ -1,14 +1,18 @@
 # AGENTS.md — layer-k3s
 
 Standalone candy repo for the `k3s` layer — the verified-checksum k3s binary
-installer plus its CNI runtime dependencies. The candy lives in `charly.yml` at
-the repo root: the `package:`/`distro:` sections, the `run:` install step, the
-`check:` assertions, and the embedded `skill:` entity projected into the
-marketplace corpus as `/charly-infrastructure:k3s`.
+installer plus its CNI runtime dependencies, and `k3s-shared-containerd`, which
+points k3s at the ONE shared containerd with the `krun`/`nvidia` RuntimeClasses
+and the restart-after-runtime-handler-change rule. The entities live in
+`charly.yml` at the repo root, with the skill body in `.agents/skills/k3s/` and
+the embedded `skill:` entity projected into the marketplace corpus as
+`/charly-infrastructure:k3s`.
 
 Canonical files:
 
-- `charly.yml` — the `k3s:` candy entity and the `k3s-skill:` skill entity.
+- `charly.yml` — the `k3s:` and `k3s-shared-containerd:` candy entities, the
+  `k3s-shared-containerd-app:` local template, the
+  `check-k3s-shared-containerd:` bed, and the `k3s-skill:` skill entity.
 - `.github/workflows/tag-on-merge.yml` — CalVer tag + `CHANGELOG/` on merge.
 - `README.md` — user overview only; never agent guidance.
 
@@ -30,6 +34,10 @@ Canonical files:
   valid on every distro arm they run on. Scope a distro-specific check in the
   command itself — the check runner does not honour runner-level
   `exclude-distro` fields.
+- The handler guard's branch logic is covered by
+  `bash test/k3s-runtime-handler-guard-test.sh`; run it whenever
+  `files/k3s-runtime-handler-guard.sh` changes.
+- `charly box validate` must stay at 0 warnings, 0 errors.
 
 ## Modify this repo
 
@@ -41,6 +49,16 @@ Canonical files:
   The checksum verification is part of the install contract — keep it.
 - New behaviour claims belong in the `plan:` as an observable `check:` step, and
   in the skill body.
+- `k3s-shared-containerd` owns only the k3s side of the shared daemon (endpoint,
+  the two k3s CNI keys in a partial `conf.d` drop-in, the RuntimeClass manifests,
+  and the handler guard). Never rewrite the shared containerd's full config or
+  start a daemon from this repo.
+- The `check-k3s-shared-containerd` bed is a `host: local` bed: run it inside a
+  disposable containerd-host venue (`charly --host … check run …`), never on an
+  operator workstation.
+- `files/k3s-runtime-handler-guard.sh` and
+  `test/k3s-runtime-handler-guard-test.sh` move together: a behavior change in
+  the guard is only landed with its branch test updated.
 
 ## Landing
 

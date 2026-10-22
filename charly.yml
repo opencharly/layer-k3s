@@ -138,11 +138,291 @@ k3s:
                     arch: iptables-nft
                 installed: true
 
+k3s-shared-containerd:
+    candy:
+        description: |
+            Points k3s at the ONE shared containerd instead of letting k3s run its
+            embedded one. Installs /etc/rancher/k3s/config.yaml with
+            container-runtime-endpoint: unix:///run/containerd/containerd.sock, a
+            containerd conf.d drop-in carrying only the two k3s-specific CNI keys
+            (bin_dirs + conf_dir, K3S.md §2.1), the krun and nvidia RuntimeClass
+            manifests in k3s's auto-deploy manifests directory (K3S.md §4), and a
+            runtime-handler fingerprint guard that restarts k3s when the shared
+            daemon's handler set changes (K3S.md §2.3 step 3). The shared daemon
+            itself, its root/state directories and its full CRI config are owned by
+            the containerd-host image, never by this layer.
+        require:
+            - k3s
+        plan:
+            - run: create the k3s config directory
+              mkdir: /etc/rancher/k3s
+              run_as: root
+              mode: "0755"
+            - run: point k3s at the shared containerd socket
+              write: /etc/rancher/k3s/config.yaml
+              mode: "0644"
+              run_as: root
+              content: |
+                # k3s must use the ONE shared containerd, never its embedded one.
+                # K3S.md §1, §2.2. The socket below belongs to the rootful daemon
+                # owned by the containerd-host image; this layer starts no daemon.
+                container-runtime-endpoint: unix:///run/containerd/containerd.sock
+            - run: create the containerd drop-in directory
+              mkdir: /etc/containerd/conf.d
+              run_as: root
+              mode: "0755"
+            - run: give the shared containerd the two k3s-specific CNI directories
+              write: /etc/containerd/conf.d/50-k3s-cni.toml
+              mode: "0644"
+              run_as: root
+              content: |
+                # k3s writes its flannel conflist and CNI binaries under its own data
+                # dir; stock containerd does not read them. This is a PARTIAL config
+                # imported by the shared daemon's version-4 config (imports =
+                # ["/etc/containerd/conf.d/*.toml"]), so it adds ONLY these two keys.
+                # K3S.md §2.1.
+                [plugins.'io.containerd.cri.v1.runtime'.cni]
+                  bin_dirs = ['/var/lib/rancher/k3s/data/current/bin']
+                  conf_dir = '/var/lib/rancher/k3s/agent/etc/cni/net.d'
+            - run: create k3s's auto-deploy manifests directory
+              mkdir: /var/lib/rancher/k3s/server/manifests
+              run_as: root
+              mode: "0755"
+            - run: install the krun RuntimeClass manifest
+              write: /var/lib/rancher/k3s/server/manifests/krun-runtimeclass.yaml
+              mode: "0644"
+              run_as: root
+              content: |
+                # K3S.md §4 / CONTAINERD.md §5.2: k3s auto-applies every manifest in
+                # this directory, so the class exists as soon as the server starts.
+                # The krun HANDLER lives in the shared containerd's CRI config.
+                apiVersion: node.k8s.io/v1
+                kind: RuntimeClass
+                metadata:
+                  name: krun
+                handler: krun
+            - run: install the nvidia RuntimeClass manifest
+              write: /var/lib/rancher/k3s/server/manifests/nvidia-runtimeclass.yaml
+              mode: "0644"
+              run_as: root
+              content: |
+                # K3S.md §4: the nvidia handler is contributed by the shared
+                # containerd's NVIDIA toolkit drop-in (nvidia-cdi-host). The class is
+                # declarative here so a GPU pod needs no imperative kubectl apply.
+                apiVersion: node.k8s.io/v1
+                kind: RuntimeClass
+                metadata:
+                  name: nvidia
+                handler: nvidia
+            - run: install the runtime-handler guard
+              write: /usr/local/bin/k3s-runtime-handler-guard
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/sh
+                # Restart k3s when the shared containerd's runtime-handler set changed.
+                #
+                # k3s asks the CRI for its runtime set once, at start, and latches the
+                # answer. A handler added to the shared containerd afterwards is
+                # invisible to kubelet until the service restarts (K3S.md §2.3 step 3).
+                # This guard fingerprints the merged containerd CRI runtime map and
+                # restarts k3s only when that fingerprint moves.
+                set -eu
+
+                state_dir=/var/lib/k3s-shared-containerd
+                state_file="${state_dir}/runtime-handlers.sha256"
+
+                # The guard has a subject only while k3s runs. At image-build time (and
+                # on a venue that has not started k3s yet) there is nothing to restart.
+                if ! systemctl is-active --quiet k3s 2>/dev/null; then
+                    exit 0
+                fi
+
+                if ! command -v containerd >/dev/null 2>&1; then
+                    echo "k3s-runtime-handler-guard: containerd is not on PATH; cannot read the runtime set" >&2
+                    exit 1
+                fi
+
+                # `containerd config dump` is the MERGED config: it includes conf.d.
+                handlers="$(containerd config dump 2>/dev/null \
+                    | sed -n "s/^[[:space:]]*\[plugins\.[^]]*containerd\.runtimes\.\([^].]*\)\]$/\1/p" \
+                    | sort -u \
+                    | tr '\n' ' ')"
+
+                if [ -z "${handlers}" ]; then
+                    echo "k3s-runtime-handler-guard: the merged containerd config declares no CRI runtime handlers" >&2
+                    exit 1
+                fi
+
+                fingerprint="$(printf '%s' "${handlers}" | sha256sum | cut -d' ' -f1)"
+                mkdir -p "${state_dir}"
+
+                if [ ! -f "${state_file}" ]; then
+                    printf '%s\n' "${fingerprint}" > "${state_file}"
+                    # The layer writes its config before k3s starts, so a fresh deploy
+                    # records the baseline here and k3s latches it at its own start.
+                    # If k3s was already running when this layer arrived, its latch
+                    # predates this config: restart once so it sees the new set.
+                    if systemctl is-active --quiet k3s; then
+                        echo "k3s-runtime-handler-guard: baseline recorded on a running k3s; restarting it" >&2
+                        systemctl restart k3s
+                    fi
+                    exit 0
+                fi
+
+                previous="$(cat "${state_file}")"
+                if [ "${previous}" = "${fingerprint}" ]; then
+                    exit 0
+                fi
+
+                printf '%s\n' "${fingerprint}" > "${state_file}"
+                echo "k3s-runtime-handler-guard: runtime handlers changed; restarting k3s" >&2
+                systemctl restart k3s
+            - run: record the handler baseline and restart k3s only when it moved
+              command: |
+                set -eu
+                /usr/local/bin/k3s-runtime-handler-guard
+              run_as: root
+            - check: the k3s config points at the shared containerd socket
+              file:
+                file: /etc/rancher/k3s/config.yaml
+                exists: true
+                contains: "container-runtime-endpoint: unix:///run/containerd/containerd.sock"
+            - check: the containerd drop-in carries the k3s CNI binary directory
+              file:
+                file: /etc/containerd/conf.d/50-k3s-cni.toml
+                exists: true
+                contains: "/var/lib/rancher/k3s/data/current/bin"
+            - check: the containerd drop-in carries the k3s CNI config directory
+              file:
+                file: /etc/containerd/conf.d/50-k3s-cni.toml
+                contains: "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+            - check: the krun RuntimeClass manifest is installed
+              file:
+                file: /var/lib/rancher/k3s/server/manifests/krun-runtimeclass.yaml
+                exists: true
+                contains: "handler: krun"
+            - check: the nvidia RuntimeClass manifest is installed
+              file:
+                file: /var/lib/rancher/k3s/server/manifests/nvidia-runtimeclass.yaml
+                exists: true
+                contains: "handler: nvidia"
+            - check: the runtime-handler guard is installed and executable
+              file:
+                file: /usr/local/bin/k3s-runtime-handler-guard
+                exists: true
+                mode: "0755"
+
+k3s-shared-containerd-app:
+    local:
+        description: |-
+            Disposable-venue template for the k3s-shared-containerd bed: the k3s
+            binary plus the shared-containerd wiring. It is applied on a host whose
+            /run/containerd/containerd.sock is the ONE rootful shared daemon (the
+            containerd-host image), never on an operator workstation.
+        candy:
+            - k3s-shared-containerd
+        install_opts:
+            allow_root_tasks: true
+            allow_repo_changes: true
+
+check-k3s-shared-containerd:
+    local:
+        from: k3s-shared-containerd-app
+        host: local
+        disposable: true
+        lifecycle: dev
+        description: |-
+            Three-step proof of the k3s-shared-containerd layer on a disposable
+            containerd-host venue: (1) absence - k3s is not running and no krun
+            RuntimeClass is served; (2) perform - start k3s from the config this
+            layer installed; (3) presence - the node is Ready on containerd 2.x,
+            k3s's pods are visible in `nerdctl -n k8s.io ps` on the SHARED socket
+            (the discriminating proof it is not k3s's embedded containerd), and
+            both RuntimeClasses are served. Run it INSIDE the disposable venue,
+            e.g. `charly --host <containerd-host-vm> check run
+            check-k3s-shared-containerd`; a top-level `host: local` bed writes to
+            the machine it runs on.
+        plan:
+            - check: absence - k3s is not running and no krun RuntimeClass is served yet
+              id: absent-before
+              timeout: 120s
+              context:
+                - runtime
+              command:
+                command: |
+                  set -eu
+                  sudo -n test -S /run/containerd/containerd.sock
+                  sudo -n systemctl is-active --quiet containerd
+                  if sudo -n systemctl is-active --quiet k3s; then
+                    echo "FAIL: k3s is already running before the perform step"
+                    exit 1
+                  fi
+                  if sudo -n /usr/local/bin/kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get runtimeclass krun >/dev/null 2>&1; then
+                    echo "FAIL: the krun RuntimeClass already exists before k3s started"
+                    exit 1
+                  fi
+                  echo "ABSENT: k3s is not running and no RuntimeClass is served"
+                in_container: false
+            - check: perform - start k3s from the installed config against the shared containerd
+              id: perform-start
+              timeout: 600s
+              context:
+                - runtime
+              command:
+                command: |
+                  set -eu
+                  if ! sudo -n systemctl is-active --quiet k3s; then
+                    sudo -n systemd-run --unit=k3s-shared-containerd-bed --collect \
+                      /usr/local/bin/k3s server --config /etc/rancher/k3s/config.yaml
+                  fi
+                  i=0
+                  while [ "${i}" -lt 240 ]; do
+                    if [ -f /etc/rancher/k3s/k3s.yaml ] \
+                       && sudo -n /usr/local/bin/kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes 2>/dev/null | grep -q ' Ready'; then
+                      echo "PERFORMED: k3s answered with a Ready node"
+                      exit 0
+                    fi
+                    i=$((i + 1))
+                    sleep 2
+                  done
+                  sudo -n /usr/local/bin/kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes || true
+                  echo "FAIL: k3s did not reach a Ready node within 480s"
+                  exit 1
+                in_container: false
+            - check: presence - Ready on the shared containerd, its k8s pods, and both RuntimeClasses
+              id: present-after
+              timeout: 180s
+              eventually: "120s"
+              retry_interval: "2s"
+              context:
+                - runtime
+              command:
+                command: |
+                  set -eu
+                  kubeconfig=/etc/rancher/k3s/k3s.yaml
+                  runtime="$(sudo -n /usr/local/bin/kubectl --kubeconfig "${kubeconfig}" get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}')"
+                  printf '%s\n' "${runtime}"
+                  case "${runtime}" in
+                    containerd://2.*) ;;
+                    *) echo "FAIL: the node is not running on containerd 2.x"; exit 1;;
+                  esac
+                  sudo -n /usr/local/bin/kubectl --kubeconfig "${kubeconfig}" get runtimeclass krun
+                  sudo -n /usr/local/bin/kubectl --kubeconfig "${kubeconfig}" get runtimeclass nvidia
+                  pods="$(sudo -n nerdctl --address /run/containerd/containerd.sock -n k8s.io ps --format '{{.Labels}}' | grep -c 'io.kubernetes.pod.name')"
+                  test "${pods}" -gt 0
+                  sudo -n nerdctl --address /run/containerd/containerd.sock -n k8s.io ps
+                  echo "PRESENT: node Ready on the shared containerd, k3s pods on the shared socket, krun+nvidia served"
+                in_container: false
+
 k3s-skill:
     skill:
         name: k3s
         family: infrastructure
         owner: k3s
         description: |-
-            k3s binary installer (common base for k3s-server and k3s-agent).
-            Use when building images that need the k3s binary but do NOT want a server/agent service started automatically.
+            k3s binary installer (common base for k3s-server and k3s-agent) and the
+            shared-containerd wiring (k3s-shared-containerd).
+            Use when building images that need the k3s binary, and when pointing k3s
+            at the ONE shared containerd with the krun/nvidia RuntimeClasses and the
+            restart-after-runtime-handler-change rule.

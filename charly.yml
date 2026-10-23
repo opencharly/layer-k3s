@@ -379,12 +379,12 @@ check-k3s-shared-containerd:
 
 k3s-skill:
     skill:
+        # ROUTING only. The skill's prose lives in `.agents/skills/k3s/SKILL.md`
+        # (its frontmatter description and its body) — the node's inline copy was
+        # the TRANSITIONAL in-line form, and an inline copy that disagrees with
+        # the file is a HARD ERROR for the corpus generator, which refuses the
+        # node. The file is the source of record; the node keeps the routing the
+        # consumers need (family, owner).
         name: k3s
         family: infrastructure
         owner: k3s
-        description: |-
-            k3s binary installer (common base for k3s-server and k3s-agent) and the
-            shared-containerd wiring (k3s-shared-containerd).
-            Use when building images that need the k3s binary, and when pointing k3s
-            at the ONE shared containerd with the krun/nvidia RuntimeClasses and the
-            restart-after-runtime-handler-change rule.
